@@ -2,9 +2,23 @@
 
 Python scripts for the **Brighter Websites SEO Command Center** (SCOS — Strategic Content Operating System). This repo collects raw WordPress data so Claude can perform SEO analysis without making dozens of individual WP-CLI calls per session.
 
+## Repo structure
+
+```
+scos-gather/
+├── scripts/          # Data-gathering scripts (one per data source)
+├── lib/              # Shared Python utilities (SSH, WP-CLI, env, config)
+├── skills/           # Claude Code skill definitions (SKILL.md per skill)
+├── agents/           # Subagent prompt/definition markdown files
+├── schema/           # Schema.org JSON-LD templates
+├── .env.example      # SSH credential template
+├── requirements.txt
+└── README.md
+```
+
 ---
 
-## gather_content_inventory.py
+## scripts/gather_content_inventory.py
 
 ### Purpose
 
@@ -65,7 +79,7 @@ WP_PATH=/var/www/html/wordpress
 ### How to run
 
 ```bash
-python gather_content_inventory.py --site brighter-websites
+python scripts/gather_content_inventory.py --site brighter-websites
 ```
 
 Output is written to:

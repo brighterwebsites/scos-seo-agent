@@ -4,21 +4,17 @@
 
 import argparse
 import json
-import os
-import re
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-try:
-    import paramiko
-except ImportError:
-    sys.exit("ERROR: paramiko not installed. Run: pip install -r requirements.txt")
+# Allow running as `python scripts/gather_content_inventory.py` from repo root
+# by ensuring the repo root is on sys.path for `lib` imports.
+_REPO_ROOT = Path(__file__).parent.parent
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    sys.exit("ERROR: python-dotenv not installed. Run: pip install -r requirements.txt")
+from lib.wp_ssh import load_env, parse_claude_md, ssh_connect, wp  # noqa: E402
 
 SCRIPT_VERSION = "1.0.0"
 
@@ -35,109 +31,10 @@ SKIP_POST_TYPES = {
 
 
 # ---------------------------------------------------------------------------
-# Environment & config helpers
-# ---------------------------------------------------------------------------
-
-def load_env() -> dict:
-    env_path = Path(__file__).parent / ".env"
-    load_dotenv(dotenv_path=env_path)
-    required = ["SSH_HOST", "SSH_USER", "SSH_KEY_PATH", "WP_PATH"]
-    missing = [k for k in required if not os.environ.get(k)]
-    if missing:
-        sys.exit(f"ERROR: .env missing required key(s): {', '.join(missing)}\n"
-                 f"Expected .env at: {env_path}")
-    return {k: os.environ[k] for k in required}
-
-
-def parse_claude_md(site: str) -> dict:
-    # Default Windows path; override via SCOS_BASE_DIR env var for dev/CI
-    base_dir = os.environ.get(
-        "SCOS_BASE_DIR",
-        rf"C:\Users\vanes\Desktop\seo-command-center"
-    )
-    md_path = Path(base_dir) / site / "CLAUDE.md"
-    if not md_path.exists():
-        sys.exit(f"ERROR: CLAUDE.md not found at: {md_path}")
-
-    text = md_path.read_text(encoding="utf-8")
-
-    def extract(field: str) -> str:
-        match = re.search(
-            rf"(?:^|\n)\s*[-*]?\s*{re.escape(field)}\s*[:\-]\s*(.+)",
-            text,
-            re.IGNORECASE,
-        )
-        return match.group(1).strip() if match else ""
-
-    target_wp = extract("target-wordpress-domain")
-    prod_domain = extract("production-domain")
-    staging_raw = extract("staging-mode")
-
-    if not target_wp:
-        sys.exit(f"ERROR: 'target-wordpress-domain' not found in {md_path}")
-    if not prod_domain:
-        sys.exit(f"ERROR: 'production-domain' not found in {md_path}")
-
-    staging_mode = staging_raw.lower() in ("true", "yes", "1") if staging_raw else False
-
-    return {
-        "target_wordpress_domain": target_wp,
-        "production_domain": prod_domain,
-        "staging_mode": staging_mode,
-        "base_dir": str(base_dir),
-    }
-
-
-# ---------------------------------------------------------------------------
-# SSH helpers
-# ---------------------------------------------------------------------------
-
-def ssh_connect(env: dict) -> paramiko.SSHClient:
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    key_path = Path(env["SSH_KEY_PATH"]).expanduser()
-    if not key_path.exists():
-        sys.exit(f"ERROR: SSH key not found at: {key_path}")
-    try:
-        pkey = paramiko.RSAKey.from_private_key_file(str(key_path))
-    except paramiko.ssh_exception.SSHException:
-        try:
-            pkey = paramiko.Ed25519Key.from_private_key_file(str(key_path))
-        except Exception as e:
-            sys.exit(f"ERROR: Could not load SSH key {key_path}: {e}")
-
-    try:
-        client.connect(
-            hostname=env["SSH_HOST"],
-            username=env["SSH_USER"],
-            pkey=pkey,
-            timeout=30,
-        )
-    except paramiko.AuthenticationException:
-        sys.exit(f"ERROR: SSH authentication failed for {env['SSH_USER']}@{env['SSH_HOST']}")
-    except paramiko.ssh_exception.NoValidConnectionsError as e:
-        sys.exit(f"ERROR: SSH connection failed to {env['SSH_HOST']}: {e}")
-    except Exception as e:
-        sys.exit(f"ERROR: SSH connection error ({env['SSH_HOST']}): {e}")
-
-    return client
-
-
-def wp(client: paramiko.SSHClient, wp_path: str, cmd: str) -> str:
-    full_cmd = f"wp --path={wp_path} {cmd}"
-    _, stdout, stderr = client.exec_command(full_cmd)
-    out = stdout.read().decode("utf-8").strip()
-    err = stderr.read().decode("utf-8").strip()
-    if "command not found" in err.lower() or "wp: not found" in err.lower():
-        sys.exit(f"ERROR: WP-CLI not found on remote server. Tried: {full_cmd}")
-    return out
-
-
-# ---------------------------------------------------------------------------
 # Step 0 — Validate siteurl
 # ---------------------------------------------------------------------------
 
-def validate_siteurl(client: paramiko.SSHClient, wp_path: str, target_wp: str):
+def validate_siteurl(client, wp_path: str, target_wp: str):
     siteurl = wp(client, wp_path, "option get siteurl").rstrip("/")
     expected = target_wp.rstrip("/")
     if siteurl.lower() != expected.lower():
@@ -153,7 +50,7 @@ def validate_siteurl(client: paramiko.SSHClient, wp_path: str, target_wp: str):
 # Step 1 — Discover post types
 # ---------------------------------------------------------------------------
 
-def discover_post_types(client: paramiko.SSHClient, wp_path: str) -> tuple[list, list, list]:
+def discover_post_types(client, wp_path: str) -> tuple[list, list, list]:
     raw = wp(client, wp_path, "post-type list --fields=name,label,public,_builtin --format=json")
     try:
         all_types = json.loads(raw)
@@ -169,11 +66,9 @@ def discover_post_types(client: paramiko.SSHClient, wp_path: str) -> tuple[list,
         if name in SKIP_POST_TYPES:
             excluded.append(name)
             continue
-        is_builtin = str(pt.get("_builtin", "0")) in ("1", "true", "True")
         is_public = str(pt.get("public", "0")) in ("1", "true", "True")
 
-        # Always consider post and page; skip non-public non-builtins
-        if name not in ("post", "page") and (not is_public):
+        if name not in ("post", "page") and not is_public:
             excluded.append(name)
             continue
 
@@ -196,7 +91,7 @@ def discover_post_types(client: paramiko.SSHClient, wp_path: str) -> tuple[list,
 # Step 2 — Auto-detect content analysis prefix
 # ---------------------------------------------------------------------------
 
-def detect_prefix(client: paramiko.SSHClient, wp_path: str, included_types: list) -> str:
+def detect_prefix(client, wp_path: str, included_types: list) -> str:
     for post_type in included_types:
         raw = wp(client, wp_path,
                  f"post list --post_type={post_type} --post_status=publish "
@@ -216,7 +111,7 @@ def detect_prefix(client: paramiko.SSHClient, wp_path: str, included_types: list
                     f"eval 'echo get_post_meta({post_id}, \"bw_last_analyzed\", true);'")
         if val_bw:
             return "bw_"
-        # First post found, prefix indeterminate — default to scos_ca_
+        # First post found but prefix indeterminate — default to scos_ca_
         return "scos_ca_"
     return "scos_ca_"
 
@@ -251,11 +146,9 @@ def build_meta_php(post_id: int, prefix: str) -> str:
     )
 
 
-def fetch_taxonomy_term(client: paramiko.SSHClient, wp_path: str,
-                        post_id: int, taxonomy: str) -> str:
+def fetch_taxonomy_term(client, wp_path: str, post_id: int, taxonomy: str) -> str:
     raw = wp(client, wp_path,
              f"post term list {post_id} {taxonomy} --fields=name --format=csv")
-    # WP-CLI prints "name" as header then values; strip header
     lines = [l.strip() for l in raw.splitlines() if l.strip() and l.strip().lower() != "name"]
     return ", ".join(lines) if lines else ""
 
@@ -266,13 +159,8 @@ def or_null(val):
     return val
 
 
-def collect_posts(
-    client: paramiko.SSHClient,
-    wp_path: str,
-    included_types: list,
-    prefix: str,
-    production_domain: str,
-) -> list:
+def collect_posts(client, wp_path: str, included_types: list,
+                  prefix: str, production_domain: str) -> list:
     posts_out = []
     prod_base = production_domain.rstrip("/")
 
@@ -290,7 +178,6 @@ def collect_posts(
             post_id = int(p["ID"])
             slug = p.get("post_name", "")
 
-            # Call A — batch meta
             meta_cmd = build_meta_php(post_id, prefix)
             meta_raw = wp(client, wp_path, meta_cmd)
             try:
@@ -298,16 +185,12 @@ def collect_posts(
             except (json.JSONDecodeError, TypeError):
                 meta = {}
 
-            # Call B — cluster taxonomy
             cluster = fetch_taxonomy_term(client, wp_path, post_id, "scos_content_cluster")
-
-            # Call C — topic taxonomy
             topic = fetch_taxonomy_term(client, wp_path, post_id, "scos_topic")
 
             last_analyzed = meta.get("last_analyzed", "")
             analysis_status = "complete" if last_analyzed else "pending"
 
-            # Derived URLs
             production_url = f"{prod_base}/{slug}/" if slug else None
             gsc_url = (
                 f"https://search.google.com/search-console/performance/"
@@ -316,7 +199,6 @@ def collect_posts(
             )
             ga4_path = f"/{slug}/" if slug else None
 
-            # Strategy meta nulled if bw_ prefix
             def strat(key):
                 if prefix == "bw_":
                     return None
@@ -362,7 +244,7 @@ def collect_posts(
 # Step 5 — Write output
 # ---------------------------------------------------------------------------
 
-def write_output(site: str, base_dir: str, payload: dict):
+def write_output(site: str, base_dir: str, payload: dict) -> str:
     out_dir = Path(base_dir) / site / "data"
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -391,34 +273,23 @@ def main():
     args = parser.parse_args()
     site = args.site
 
-    # Step 0a — load env
     env = load_env()
-
-    # Step 0b — parse CLAUDE.md
     config = parse_claude_md(site)
 
-    # Step 0c — SSH connect + validate siteurl
     print(f"Connecting to {env['SSH_HOST']} …")
     client = ssh_connect(env)
     validate_siteurl(client, env["WP_PATH"], config["target_wordpress_domain"])
 
-    # Step 1 — discover post types
     print("Discovering post types …")
     found, included, excluded = discover_post_types(client, env["WP_PATH"])
     print(f"  Included: {included}")
 
-    # Step 2 — detect prefix
     prefix = detect_prefix(client, env["WP_PATH"], included)
     print(f"  Content analysis prefix: {prefix}")
 
-    # Step 3 — collect posts
     print("Collecting posts …")
     posts = collect_posts(
-        client,
-        env["WP_PATH"],
-        included,
-        prefix,
-        config["production_domain"],
+        client, env["WP_PATH"], included, prefix, config["production_domain"],
     )
     client.close()
 
@@ -427,14 +298,12 @@ def main():
     complete_count = total - pending_count
     pending_pct = (pending_count / total * 100) if total else 0.0
 
-    # Step 4 — pending warning
     if total > 0 and pending_count / total > 0.20:
         print(
             f"\nWARNING: {pending_count}/{total} posts ({pending_pct:.0f}%) have no analysis data.\n"
             f"Run the SCOS content analysis tool to backfill before using this inventory.\n"
         )
 
-    # Step 5 — assemble and write
     collected_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     payload = {
         "meta": {
