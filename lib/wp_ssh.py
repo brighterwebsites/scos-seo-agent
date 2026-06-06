@@ -113,3 +113,24 @@ def wp(client: paramiko.SSHClient, wp_path: str, cmd: str) -> str:
     if "command not found" in err.lower() or "wp: not found" in err.lower():
         sys.exit(f"ERROR: WP-CLI not found on remote server. Tried: {full_cmd}")
     return out
+
+
+def wp_eval_stdin(client: paramiko.SSHClient, wp_path: str, php_code: str) -> str:
+    """Run a PHP file (passed via STDIN) through `wp eval-file -`.
+
+    Boots WordPress once and returns whatever the PHP echoes. This collapses
+    what would otherwise be hundreds of per-post `wp` invocations (each a full
+    WP bootstrap) into a single round-trip.
+    """
+    full_cmd = f"wp --path={wp_path} eval-file -"
+    stdin, stdout, stderr = client.exec_command(full_cmd)
+    stdin.write(php_code)
+    stdin.flush()
+    stdin.channel.shutdown_write()
+    out = stdout.read().decode("utf-8")
+    err = stderr.read().decode("utf-8").strip()
+    if "command not found" in err.lower() or "wp: not found" in err.lower():
+        sys.exit(f"ERROR: WP-CLI not found on remote server. Tried: {full_cmd}")
+    if not out.strip():
+        sys.exit(f"ERROR: empty output from `wp eval-file -`.\nSTDERR:\n{err}")
+    return out

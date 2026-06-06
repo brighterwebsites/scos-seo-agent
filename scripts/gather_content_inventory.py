@@ -1,24 +1,33 @@
-# v3 TODO: local SQLite caching layer — store collected JSON in a local db
-# so re-runs can diff against prior state rather than full re-collect.
-# Not in scope for v1/v2.
+# Gathers a full WordPress content inventory in ONE server-side pass.
+#
+# Performance note: earlier versions issued ~3 `wp` calls per post (meta + two
+# taxonomy lookups). Every `wp` call boots the entire WordPress stack on the
+# server, so a ~380-post site meant ~1,140 bootstraps over SSH — tens of
+# minutes. This version pipes a single PHP gatherer to `wp eval-file -`, which
+# boots WordPress ONCE, loops every post server-side, and returns the whole
+# inventory in a single round-trip (seconds).
+#
+# v3 TODO: local SQLite caching layer + `--since` incremental collection.
 
 import argparse
 import json
+import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-# Allow running as `python scripts/gather_content_inventory.py` from repo root
-# by ensuring the repo root is on sys.path for `lib` imports.
+# Allow running as `python scripts/gather_content_inventory.py` from repo root.
 _REPO_ROOT = Path(__file__).parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from lib.wp_ssh import load_env, parse_claude_md, ssh_connect, wp  # noqa: E402
+from lib.wp_ssh import load_env, parse_claude_md, ssh_connect, wp, wp_eval_stdin  # noqa: E402
 
-SCRIPT_VERSION = "1.0.0"
+SCRIPT_VERSION = "2.0.0"
 
-SKIP_POST_TYPES = {
+# Internal/builtin post types never worth inventorying.
+SKIP_POST_TYPES = [
     "attachment",
     "revision",
     "nav_menu_item",
@@ -27,221 +36,164 @@ SKIP_POST_TYPES = {
     "oembed_cache",
     "user_request",
     "wp_block",
+]
+
+
+# ---------------------------------------------------------------------------
+# Server-side gatherer (runs inside one WordPress bootstrap)
+# ---------------------------------------------------------------------------
+# Tokens __PROD_BASE__ and __SKIP_LIST__ are substituted before sending.
+# Output schema / field order matches the previous per-post implementation so
+# the final JSON is byte-stable (taxonomy now uses wp_get_object_terms instead
+# of CSV parsing, which removes stray quoting on term names).
+_PHP_GATHER = r"""<?php
+$prod_base = rtrim('__PROD_BASE__', '/');
+$skip = array(__SKIP_LIST__);
+
+$all = get_post_types(array(), 'objects');
+$found = array(); $included = array(); $excluded = array();
+foreach ($all as $name => $obj) { $found[] = $name; }
+foreach ($all as $name => $obj) {
+    if (in_array($name, $skip, true)) { $excluded[] = $name; continue; }
+    $is_public = !empty($obj->public);
+    if ($name !== 'post' && $name !== 'page' && !$is_public) { $excluded[] = $name; continue; }
+    $counts = wp_count_posts($name);
+    $cnt = isset($counts->publish) ? (int) $counts->publish : 0;
+    if ($cnt > 0) { $included[] = $name; } else { $excluded[] = $name; }
 }
+
+$prefix = 'scos_ca_';
+foreach ($included as $pt) {
+    $q = get_posts(array('post_type'=>$pt,'post_status'=>'publish','numberposts'=>1,'fields'=>'ids','suppress_filters'=>true));
+    if (empty($q)) { continue; }
+    $pid = $q[0];
+    if (get_post_meta($pid, 'scos_ca_last_analyzed', true)) { $prefix = 'scos_ca_'; }
+    elseif (get_post_meta($pid, 'bw_last_analyzed', true)) { $prefix = 'bw_'; }
+    else { $prefix = 'scos_ca_'; }
+    break;
+}
+
+function _nn($v) { return ($v === '' || $v === null) ? null : $v; }
+
+$is_bw = ($prefix === 'bw_');
+$posts_out = array();
+foreach ($included as $pt) {
+    $items = get_posts(array('post_type'=>$pt,'post_status'=>'publish','numberposts'=>-1,'suppress_filters'=>true));
+    foreach ($items as $post) {
+        $pid = $post->ID;
+        $slug = $post->post_name;
+
+        $last_analyzed = get_post_meta($pid, $prefix . 'last_analyzed', true);
+        $analysis_status = $last_analyzed ? 'complete' : 'pending';
+
+        $cl = wp_get_object_terms($pid, 'scos_content_cluster', array('fields'=>'names'));
+        $cluster = (!is_wp_error($cl) && !empty($cl)) ? implode(', ', $cl) : '';
+        $tp = wp_get_object_terms($pid, 'scos_topic', array('fields'=>'names'));
+        $topic = (!is_wp_error($tp) && !empty($tp)) ? implode(', ', $tp) : '';
+
+        // Use the real permalink (captures CPT rewrite bases + page hierarchy),
+        // make it relative, then prepend the configured production domain so the
+        // URL is correct AND production-mapped even when run against staging.
+        $rel = '';
+        $pl = get_permalink($pid);
+        if ($pl && !is_wp_error($pl)) { $rel = wp_make_link_relative($pl); }
+        if ($rel === '' && $slug) { $rel = '/' . $slug . '/'; }
+        $production_url = $rel ? ($prod_base . $rel) : null;
+        $gsc_url = $production_url
+            ? ('https://search.google.com/search-console/performance/search-analytics?resource_id=' . $production_url)
+            : null;
+        $ga4_path = $rel ? $rel : null;
+
+        $posts_out[] = array(
+            'id' => (int) $pid,
+            'title' => $post->post_title,
+            'slug' => $slug,
+            'post_type' => $pt,
+            'post_date' => $post->post_date,
+            'analysis_status' => $analysis_status,
+            'word_count' => _nn(get_post_meta($pid, $prefix . 'word_count', true)),
+            'h2_count' => _nn(get_post_meta($pid, $prefix . 'h2_count', true)),
+            'image_count' => _nn(get_post_meta($pid, $prefix . 'image_count', true)),
+            'reading_time' => _nn(get_post_meta($pid, $prefix . 'reading_time', true)),
+            'internal_link_count' => _nn(get_post_meta($pid, $prefix . 'links_to_internal', true)),
+            'external_link_count' => _nn(get_post_meta($pid, $prefix . 'links_to_external', true)),
+            'last_analyzed' => _nn($last_analyzed),
+            'scos_ca_intent' => $is_bw ? null : _nn(get_post_meta($pid, 'scos_ca_intent', true)),
+            'scos_ca_purpose' => $is_bw ? null : _nn(get_post_meta($pid, 'scos_ca_purpose', true)),
+            'scos_ca_maturity' => $is_bw ? null : _nn(get_post_meta($pid, 'scos_ca_maturity', true)),
+            'scos_ca_index_status' => $is_bw ? null : _nn(get_post_meta($pid, 'scos_ca_index_status', true)),
+            'scos_ca_optimization_progress' => $is_bw ? null : _nn(get_post_meta($pid, 'scos_ca_optimization_progress', true)),
+            'scos_ca_next_step' => $is_bw ? null : _nn(get_post_meta($pid, 'scos_ca_next_step', true)),
+            'scos_seo_title' => _nn(get_post_meta($pid, 'scos_seo_title', true)),
+            'scos_seo_description' => _nn(get_post_meta($pid, 'scos_seo_description', true)),
+            'scos_seo_robots' => _nn(get_post_meta($pid, 'scos_seo_robots', true)),
+            'scos_seo_canonical' => _nn(get_post_meta($pid, 'scos_seo_canonical', true)),
+            'scos_seo_breadcrumb_title' => _nn(get_post_meta($pid, 'scos_seo_breadcrumb_title', true)),
+            'scos_seo_tldr' => _nn(get_post_meta($pid, 'scos_seo_tldr', true)),
+            'cluster' => _nn($cluster),
+            'topic' => _nn($topic),
+            'production_url' => $production_url,
+            'gsc_url' => $gsc_url,
+            'ga4_path' => $ga4_path,
+        );
+    }
+}
+
+echo json_encode(array(
+    'prefix' => $prefix,
+    'found' => $found,
+    'included' => $included,
+    'excluded' => $excluded,
+    'posts' => $posts_out,
+), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_PARTIAL_OUTPUT_ON_ERROR);
+"""
 
 
 # ---------------------------------------------------------------------------
 # Step 0 — Validate siteurl
 # ---------------------------------------------------------------------------
 
+def _host_only(url: str) -> str:
+    """Normalize a URL to bare host for identity comparison.
+
+    The WP `siteurl` scheme (http vs https) can flip independently of which
+    site you're actually pointed at, so we compare host only — scheme and
+    trailing slash are irrelevant to identity and were a recurring tripwire.
+    """
+    return re.sub(r"^https?://", "", url.strip(), flags=re.IGNORECASE).rstrip("/").lower()
+
+
 def validate_siteurl(client, wp_path: str, target_wp: str):
-    siteurl = wp(client, wp_path, "option get siteurl").rstrip("/")
-    expected = target_wp.rstrip("/")
-    if siteurl.lower() != expected.lower():
+    siteurl = wp(client, wp_path, "option get siteurl")
+    if _host_only(siteurl) != _host_only(target_wp):
         sys.exit(
-            f"ERROR: siteurl mismatch.\n"
+            f"ERROR: siteurl host mismatch.\n"
             f"  WP reports: {siteurl}\n"
-            f"  Expected:   {expected}\n"
+            f"  Expected:   {target_wp}\n"
             f"Check target-wordpress-domain in CLAUDE.md or --site argument."
         )
 
 
 # ---------------------------------------------------------------------------
-# Step 1 — Discover post types
+# Gather (single server-side pass)
 # ---------------------------------------------------------------------------
 
-def discover_post_types(client, wp_path: str) -> tuple[list, list, list]:
-    raw = wp(client, wp_path, "post-type list --fields=name,label,public,_builtin --format=json")
-    try:
-        all_types = json.loads(raw)
-    except json.JSONDecodeError:
-        sys.exit(f"ERROR: Could not parse post-type list output:\n{raw}")
-
-    found = [pt["name"] for pt in all_types]
-    included = []
-    excluded = []
-
-    for pt in all_types:
-        name = pt["name"]
-        if name in SKIP_POST_TYPES:
-            excluded.append(name)
-            continue
-        is_public = str(pt.get("public", "0")) in ("1", "true", "True")
-
-        if name not in ("post", "page") and not is_public:
-            excluded.append(name)
-            continue
-
-        count_raw = wp(client, wp_path,
-                       f"post list --post_type={name} --post_status=publish --format=count")
-        try:
-            count = int(count_raw.strip())
-        except ValueError:
-            count = 0
-
-        if count > 0:
-            included.append(name)
-        else:
-            excluded.append(name)
-
-    return found, included, excluded
-
-
-# ---------------------------------------------------------------------------
-# Step 2 — Auto-detect content analysis prefix
-# ---------------------------------------------------------------------------
-
-def detect_prefix(client, wp_path: str, included_types: list) -> str:
-    for post_type in included_types:
-        raw = wp(client, wp_path,
-                 f"post list --post_type={post_type} --post_status=publish "
-                 f"--fields=ID --format=json --posts_per_page=1")
-        try:
-            posts = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not posts:
-            continue
-        post_id = posts[0]["ID"]
-        val = wp(client, wp_path,
-                 f"eval 'echo get_post_meta({post_id}, \"scos_ca_last_analyzed\", true);'")
-        if val:
-            return "scos_ca_"
-        val_bw = wp(client, wp_path,
-                    f"eval 'echo get_post_meta({post_id}, \"bw_last_analyzed\", true);'")
-        if val_bw:
-            return "bw_"
-        # First post found but prefix indeterminate — default to scos_ca_
-        return "scos_ca_"
-    return "scos_ca_"
-
-
-# ---------------------------------------------------------------------------
-# Step 3 — Per-post data collection
-# ---------------------------------------------------------------------------
-
-def build_meta_php(post_id: int, prefix: str) -> str:
-    return (
-        "eval 'echo json_encode(array("
-        f"\"word_count\"=>get_post_meta({post_id},\"{prefix}word_count\",true),"
-        f"\"h2_count\"=>get_post_meta({post_id},\"{prefix}h2_count\",true),"
-        f"\"image_count\"=>get_post_meta({post_id},\"{prefix}image_count\",true),"
-        f"\"reading_time\"=>get_post_meta({post_id},\"{prefix}reading_time\",true),"
-        f"\"links_to_internal\"=>get_post_meta({post_id},\"{prefix}links_to_internal\",true),"
-        f"\"links_to_external\"=>get_post_meta({post_id},\"{prefix}links_to_external\",true),"
-        f"\"last_analyzed\"=>get_post_meta({post_id},\"{prefix}last_analyzed\",true),"
-        f"\"scos_ca_intent\"=>get_post_meta({post_id},\"scos_ca_intent\",true),"
-        f"\"scos_ca_purpose\"=>get_post_meta({post_id},\"scos_ca_purpose\",true),"
-        f"\"scos_ca_maturity\"=>get_post_meta({post_id},\"scos_ca_maturity\",true),"
-        f"\"scos_ca_index_status\"=>get_post_meta({post_id},\"scos_ca_index_status\",true),"
-        f"\"scos_ca_optimization_progress\"=>get_post_meta({post_id},\"scos_ca_optimization_progress\",true),"
-        f"\"scos_ca_next_step\"=>get_post_meta({post_id},\"scos_ca_next_step\",true),"
-        f"\"scos_seo_title\"=>get_post_meta({post_id},\"scos_seo_title\",true),"
-        f"\"scos_seo_description\"=>get_post_meta({post_id},\"scos_seo_description\",true),"
-        f"\"scos_seo_robots\"=>get_post_meta({post_id},\"scos_seo_robots\",true),"
-        f"\"scos_seo_canonical\"=>get_post_meta({post_id},\"scos_seo_canonical\",true),"
-        f"\"scos_seo_breadcrumb_title\"=>get_post_meta({post_id},\"scos_seo_breadcrumb_title\",true),"
-        f"\"scos_seo_tldr\"=>get_post_meta({post_id},\"scos_seo_tldr\",true)"
-        "));'"
+def gather_inventory(client, wp_path: str, production_domain: str) -> dict:
+    skip_list = ",".join(f"'{s}'" for s in SKIP_POST_TYPES)
+    php = (
+        _PHP_GATHER
+        .replace("__PROD_BASE__", production_domain.rstrip("/"))
+        .replace("__SKIP_LIST__", skip_list)
     )
-
-
-def fetch_taxonomy_term(client, wp_path: str, post_id: int, taxonomy: str) -> str:
-    raw = wp(client, wp_path,
-             f"post term list {post_id} {taxonomy} --fields=name --format=csv")
-    lines = [l.strip() for l in raw.splitlines() if l.strip() and l.strip().lower() != "name"]
-    return ", ".join(lines) if lines else ""
-
-
-def or_null(val):
-    if val is None or val == "":
-        return None
-    return val
-
-
-def collect_posts(client, wp_path: str, included_types: list,
-                  prefix: str, production_domain: str) -> list:
-    posts_out = []
-    prod_base = production_domain.rstrip("/")
-
-    for post_type in included_types:
-        raw = wp(client, wp_path,
-                 f"post list --post_type={post_type} --post_status=publish "
-                 f"--fields=ID,post_title,post_name,post_date --format=json")
-        try:
-            posts = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            print(f"WARNING: Could not parse post list for post_type={post_type}")
-            continue
-
-        for p in posts:
-            post_id = int(p["ID"])
-            slug = p.get("post_name", "")
-
-            meta_cmd = build_meta_php(post_id, prefix)
-            meta_raw = wp(client, wp_path, meta_cmd)
-            try:
-                meta = json.loads(meta_raw)
-            except (json.JSONDecodeError, TypeError):
-                meta = {}
-
-            cluster = fetch_taxonomy_term(client, wp_path, post_id, "scos_content_cluster")
-            topic = fetch_taxonomy_term(client, wp_path, post_id, "scos_topic")
-
-            last_analyzed = meta.get("last_analyzed", "")
-            analysis_status = "complete" if last_analyzed else "pending"
-
-            production_url = f"{prod_base}/{slug}/" if slug else None
-            gsc_url = (
-                f"https://search.google.com/search-console/performance/"
-                f"search-analytics?resource_id={production_url}"
-                if production_url else None
-            )
-            ga4_path = f"/{slug}/" if slug else None
-
-            def strat(key):
-                if prefix == "bw_":
-                    return None
-                return or_null(meta.get(key))
-
-            posts_out.append({
-                "id": post_id,
-                "title": p.get("post_title", ""),
-                "slug": slug,
-                "post_type": post_type,
-                "post_date": p.get("post_date", ""),
-                "analysis_status": analysis_status,
-                "word_count": or_null(meta.get("word_count")),
-                "h2_count": or_null(meta.get("h2_count")),
-                "image_count": or_null(meta.get("image_count")),
-                "reading_time": or_null(meta.get("reading_time")),
-                "internal_link_count": or_null(meta.get("links_to_internal")),
-                "external_link_count": or_null(meta.get("links_to_external")),
-                "last_analyzed": or_null(last_analyzed),
-                "scos_ca_intent": strat("scos_ca_intent"),
-                "scos_ca_purpose": strat("scos_ca_purpose"),
-                "scos_ca_maturity": strat("scos_ca_maturity"),
-                "scos_ca_index_status": strat("scos_ca_index_status"),
-                "scos_ca_optimization_progress": strat("scos_ca_optimization_progress"),
-                "scos_ca_next_step": strat("scos_ca_next_step"),
-                "scos_seo_title": or_null(meta.get("scos_seo_title")),
-                "scos_seo_description": or_null(meta.get("scos_seo_description")),
-                "scos_seo_robots": or_null(meta.get("scos_seo_robots")),
-                "scos_seo_canonical": or_null(meta.get("scos_seo_canonical")),
-                "scos_seo_breadcrumb_title": or_null(meta.get("scos_seo_breadcrumb_title")),
-                "scos_seo_tldr": or_null(meta.get("scos_seo_tldr")),
-                "cluster": or_null(cluster),
-                "topic": or_null(topic),
-                "production_url": production_url,
-                "gsc_url": gsc_url,
-                "ga4_path": ga4_path,
-            })
-
-    return posts_out
+    raw = wp_eval_stdin(client, wp_path, php)
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        sys.exit(f"ERROR: could not parse gatherer output as JSON:\n{raw[:2000]}")
 
 
 # ---------------------------------------------------------------------------
-# Step 5 — Write output
+# Write output
 # ---------------------------------------------------------------------------
 
 def write_output(site: str, base_dir: str, payload: dict) -> str:
@@ -266,35 +218,33 @@ def write_output(site: str, base_dir: str, payload: dict) -> str:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Gather WordPress content inventory via SSH/WP-CLI."
+        description="Gather WordPress content inventory via SSH/WP-CLI (single-pass)."
     )
-    parser.add_argument("--site", required=True,
-                        help="Site slug, e.g. brighter-websites")
+    parser.add_argument("--site", required=True, help="Site slug, e.g. brighter-websites")
     args = parser.parse_args()
     site = args.site
 
     env = load_env()
     config = parse_claude_md(site)
 
-    print(f"Connecting to {env['SSH_HOST']} …")
+    print(f"Connecting to {env['SSH_HOST']} ...")
     client = ssh_connect(env)
     validate_siteurl(client, env["WP_PATH"], config["target_wordpress_domain"])
 
-    print("Discovering post types …")
-    found, included, excluded = discover_post_types(client, env["WP_PATH"])
-    print(f"  Included: {included}")
-
-    prefix = detect_prefix(client, env["WP_PATH"], included)
-    print(f"  Content analysis prefix: {prefix}")
-
-    print("Collecting posts …")
-    posts = collect_posts(
-        client, env["WP_PATH"], included, prefix, config["production_domain"],
-    )
+    print("Gathering inventory (single server-side pass) ...")
+    t0 = time.monotonic()
+    result = gather_inventory(client, env["WP_PATH"], config["production_domain"])
+    elapsed = time.monotonic() - t0
     client.close()
 
+    posts = result.get("posts", [])
+    prefix = result.get("prefix", "scos_ca_")
+    found = result.get("found", [])
+    included = result.get("included", [])
+    excluded = result.get("excluded", [])
+
     total = len(posts)
-    pending_count = sum(1 for p in posts if p["analysis_status"] == "pending")
+    pending_count = sum(1 for p in posts if p.get("analysis_status") == "pending")
     complete_count = total - pending_count
     pending_pct = (pending_count / total * 100) if total else 0.0
 
@@ -333,6 +283,7 @@ def main():
         f"Posts collected: {total}\n"
         f"Analysis pending: {pending_count} ({pending_pct:.0f}%)\n"
         f"Content analysis prefix: {prefix}\n"
+        f"Gather time: {elapsed:.1f}s (single pass)\n"
         f"File written: {out_path}\n"
         f"Next: run Task A (GSC/GA4) or Task B if traffic-signals.json already exists"
     )
